@@ -1,0 +1,49 @@
+{
+  "title": "French Revolution - Grade 5",
+  "start": "france_before_revolution",
+  "nodes": [
+    {
+      "id": "france_before_revolution",
+      "title": "France Before the Revolution",
+      "description": "Understand how people lived in France before the revolution and the social structure.",
+      "book": "French Revolution Basics"
+    },
+    {
+      "id": "three_estates",
+      "title": "The Three Estates",
+      "description": "Learn about the three groups in society and their roles.",
+      "book": "French Revolution Basics"
+    },
+    {
+      "id": "causes_of_revolution",
+      "title": "Causes of the Revolution",
+      "description": "Understand why people became unhappy and demanded change.",
+      "book": "French Revolution Basics"
+    },
+    {
+      "id": "storming_bastille",
+      "title": "Storming of the Bastille",
+      "description": "Learn about the important event that started the revolution.",
+      "book": "French Revolution Basics"
+    },
+    {
+      "id": "end_of_monarchy",
+      "title": "End of Monarchy",
+      "description": "Understand how the king lost power and what happened next.",
+      "book": "French Revolution Basics"
+    },
+    {
+      "id": "revolution_results",
+      "title": "Results of the Revolution",
+      "description": "Learn how the revolution changed France and its people.",
+      "book": "French Revolution Basics"
+    }
+  ],
+  "edges": [
+    { "from": "france_before_revolution", "to": "three_estates" },
+    { "from": "three_estates", "to": "causes_of_revolution" },
+    { "from": "causes_of_revolution", "to": "storming_bastille" },
+    { "from": "storming_bastille", "to": "end_of_monarchy" },
+    { "from": "end_of_monarchy", "to": "revolution_results" }
+  ]
+}

@@ -1,0 +1,1285 @@
+# =============================================================================
+# LoRA Personality Training System — with Curriculum Graph + Book Teaching
+# Compatible with: Google Colab (T4 GPU, ~12GB VRAM)
+#
+# NEW FEATURES:
+#   • Curriculum Graph  — JSON file defining topics as nodes + prerequisite edges
+#   • Books             — Upload .txt reference books mapped to curriculum topics
+#   • Master Prompt     — 3-phase teaching loop: Negotiate → Teach → Advance
+# =============================================================================
+
+# =============================================================================
+# SECTION 1: Install Dependencies
+# Run this cell first in Google Colab
+# =============================================================================
+"""
+!pip install -q -U bitsandbytes>=0.46.1
+!pip install -q transformers==4.40.0
+!pip install -q peft==0.10.0
+!pip install -q accelerate==0.29.3
+!pip install -q gradio==4.28.3
+!pip install -q datasets==2.18.0
+"""
+
+# =============================================================================
+# SECTION 2: Imports
+# =============================================================================
+import os
+import re
+import json
+import queue
+import shutil
+import threading
+import torch
+import gradio as gr
+from pathlib import Path
+from typing import Optional, Generator
+
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    BitsAndBytesConfig,
+    TrainingArguments,
+    Trainer,
+    TrainerCallback,
+    DataCollatorForSeq2Seq,
+)
+from peft import (
+    LoraConfig,
+    get_peft_model,
+    PeftModel,
+    TaskType,
+    prepare_model_for_kbit_training,
+)
+from datasets import Dataset
+
+
+# =============================================================================
+# SECTION 3: Global Configuration
+# =============================================================================
+
+BASE_MODEL_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+LORA_DIR      = "./lora_personalities"
+BOOKS_DIR     = "./books"
+CURRICULA_DIR = "./curricula"
+
+# Personality adapters  {name → adapter_path | None}
+personalities: dict[str, Optional[str]] = {
+    "default (no adapter)": None
+}
+
+# Books store  {display_title → full_text}
+books: dict[str, str] = {}
+
+# Active curriculum graph loaded from JSON
+# Shape: { "title": str, "start": str,
+#           "nodes": [{"id","title","description","book"},...],
+#           "edges": [{"from","to"},...] }
+curriculum_graph: dict = {}
+
+_base_model  = None
+_tokenizer   = None
+
+
+# =============================================================================
+# SECTION 4: Model Loading  (unchanged)
+# =============================================================================
+
+def _check_bitsandbytes() -> bool:
+    try:
+        import bitsandbytes as bnb
+        from packaging.version import Version
+        return Version(bnb.__version__) >= Version("0.46.1")
+    except Exception:
+        return False
+
+
+def load_base_model_and_tokenizer():
+    global _base_model, _tokenizer
+
+    if _base_model is not None and _tokenizer is not None:
+        return
+
+    print(f"[INFO] Loading tokenizer from {BASE_MODEL_ID} ...")
+    _tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID, use_fast=True)
+    _tokenizer.pad_token       = _tokenizer.eos_token
+    _tokenizer.padding_side    = "right"
+
+    has_cuda = torch.cuda.is_available()
+    has_bnb  = _check_bitsandbytes()
+
+    if has_cuda and has_bnb:
+        print("[INFO] Loading model in 4-bit quantized mode (bitsandbytes NF4) ...")
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+        )
+        _base_model = AutoModelForCausalLM.from_pretrained(
+            BASE_MODEL_ID,
+            quantization_config=bnb_config,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+    elif has_cuda:
+        print("[WARN] bitsandbytes >=0.46.1 not found — loading in float16.")
+        _base_model = AutoModelForCausalLM.from_pretrained(
+            BASE_MODEL_ID,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+    else:
+        print("[WARN] No CUDA GPU detected — loading on CPU (very slow).")
+        _base_model = AutoModelForCausalLM.from_pretrained(
+            BASE_MODEL_ID,
+            torch_dtype=torch.float32,
+            trust_remote_code=True,
+        )
+
+    _base_model.config.use_cache = False
+    print("[INFO] Base model loaded successfully ✅")
+
+
+# =============================================================================
+# SECTION 5: Dataset Processing  (unchanged)
+# =============================================================================
+
+def parse_conversation_file(filepath: str) -> list[dict]:
+    samples = []
+    teacher_pattern = re.compile(r"^Teacher:\s*(.+)", re.IGNORECASE)
+    student_pattern = re.compile(r"^Student:\s*(.+)", re.IGNORECASE)
+
+    with open(filepath, "r", encoding="utf-8") as f:
+        lines = [l.strip() for l in f.readlines() if l.strip()]
+
+    pending_student = None
+    for line in lines:
+        t_match = teacher_pattern.match(line)
+        s_match = student_pattern.match(line)
+        if s_match:
+            pending_student = s_match.group(1).strip()
+        elif t_match and pending_student:
+            samples.append({
+                "instruction": "You are a helpful teacher. Respond clearly and encouragingly.",
+                "input":       pending_student,
+                "output":      t_match.group(1).strip(),
+            })
+            pending_student = None
+
+    return samples
+
+
+def tokenize_sample(sample: dict, tokenizer, max_length: int = 512) -> dict:
+    prompt = (
+        f"<|system|>\nYou are a gentle teacher.</s>\n"
+        f"<|user|>\nStudent: {sample['input']}</s>\n"
+        f"<|assistant|>\nTeacher: {sample['output']}</s>"
+    )
+    tokenized = tokenizer(
+        prompt,
+        truncation=True,
+        max_length=max_length,
+        padding="max_length",
+        return_tensors="pt",
+    )
+    input_ids      = tokenized["input_ids"][0]
+    attention_mask = tokenized["attention_mask"][0]
+    labels         = input_ids.clone()
+
+    assistant_token_ids = tokenizer("<|assistant|>", add_special_tokens=False)["input_ids"]
+    if assistant_token_ids:
+        aid = assistant_token_ids[0]
+        positions = (input_ids == aid).nonzero(as_tuple=True)[0]
+        if len(positions) > 0:
+            labels[: positions[0].item()] = -100
+
+    labels[labels == tokenizer.pad_token_id] = -100
+    return {
+        "input_ids":      input_ids,
+        "attention_mask": attention_mask,
+        "labels":         labels,
+    }
+
+
+def build_hf_dataset(samples: list[dict], tokenizer) -> Dataset:
+    tokenized = [tokenize_sample(s, tokenizer) for s in samples]
+    return Dataset.from_dict({
+        "input_ids":      [t["input_ids"]      for t in tokenized],
+        "attention_mask": [t["attention_mask"] for t in tokenized],
+        "labels":         [t["labels"]         for t in tokenized],
+    })
+
+
+# =============================================================================
+# SECTION 6: LoRA Training  (unchanged)
+# =============================================================================
+
+def train_lora(personality_name: str, raw_samples: list[dict]) -> Generator[str, None, None]:
+    global personalities
+
+    if not personality_name or not personality_name.strip():
+        yield "❌ Error: Personality name cannot be empty."
+        return
+
+    personality_name = personality_name.strip().replace(" ", "_").lower()
+
+    if len(raw_samples) == 0:
+        yield "❌ Error: No valid Teacher–Student pairs found in the file."
+        return
+
+    yield f"📋 Found {len(raw_samples)} training samples."
+    yield "🔧 Loading base model (this may take a minute on first run)..."
+    load_base_model_and_tokenizer()
+    yield "✅ Base model ready."
+
+    yield "📦 Tokenizing dataset..."
+    hf_dataset = build_hf_dataset(raw_samples, _tokenizer)
+    yield f"✅ Dataset prepared: {len(hf_dataset)} samples."
+
+    yield "⚙️ Configuring LoRA adapter (r=16, alpha=32)..."
+    lora_config = LoraConfig(
+        r=16,
+        lora_alpha=32,
+        target_modules=["q_proj", "v_proj"],
+        lora_dropout=0.05,
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+    )
+
+    model      = prepare_model_for_kbit_training(_base_model)
+    peft_model = get_peft_model(model, lora_config)
+    trainable, total = peft_model.get_nb_trainable_parameters()
+    yield f"✅ LoRA applied — trainable params: {trainable:,} / {total:,}"
+
+    save_path   = os.path.join(LORA_DIR, personality_name)
+    os.makedirs(save_path, exist_ok=True)
+
+    num_epochs = min(3, max(1, len(raw_samples) // 5))
+    optimizer  = "paged_adamw_8bit" if _check_bitsandbytes() else "adamw_torch"
+    use_fp16   = torch.cuda.is_available()
+    yield f"⚙️ Optimizer: {optimizer} | fp16: {use_fp16}"
+
+    training_args = TrainingArguments(
+        output_dir=save_path,
+        num_train_epochs=num_epochs,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=4,
+        warmup_steps=5,
+        learning_rate=2e-4,
+        fp16=use_fp16,
+        logging_steps=1,
+        save_strategy="no",
+        optim=optimizer,
+        report_to="none",
+        dataloader_pin_memory=False,
+    )
+
+    yield f"🏋️ Starting training for {num_epochs} epoch(s)..."
+
+    progress_queue  = queue.Queue()
+    _DONE_SENTINEL  = object()
+
+    class StreamingProgressCallback(TrainerCallback):
+        def on_epoch_begin(self, args, state, control, **kwargs):
+            progress_queue.put(f"🔄 Epoch {int(state.epoch)+1}/{num_epochs} started...")
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if logs:
+                loss = logs.get("loss")
+                if loss is not None:
+                    pct  = (state.global_step / state.max_steps * 100) if state.max_steps else 0
+                    progress_queue.put(
+                        f"   step {state.global_step}/{state.max_steps} ({pct:.1f}%) | loss: {loss:.4f}"
+                    )
+
+        def on_epoch_end(self, args, state, control, **kwargs):
+            progress_queue.put(f"✅ Epoch {int(state.epoch)}/{num_epochs} complete.")
+
+    trainer = Trainer(
+        model=peft_model,
+        args=training_args,
+        train_dataset=hf_dataset,
+        data_collator=DataCollatorForSeq2Seq(
+            _tokenizer,
+            model=peft_model,
+            pad_to_multiple_of=8,
+            return_tensors="pt",
+            padding=True,
+        ),
+        callbacks=[StreamingProgressCallback()],
+    )
+
+    training_error = {}
+
+    def _run_training():
+        try:
+            trainer.train()
+        except Exception as e:
+            training_error["msg"] = str(e)
+        finally:
+            progress_queue.put(_DONE_SENTINEL)
+
+    thread = threading.Thread(target=_run_training, daemon=True)
+    thread.start()
+
+    while True:
+        try:
+            msg = progress_queue.get(timeout=60)
+        except queue.Empty:
+            yield "⏳ Still training… (no update in 60s)"
+            continue
+        if msg is _DONE_SENTINEL:
+            break
+        yield msg
+
+    thread.join()
+
+    if training_error:
+        yield f"❌ Training failed: {training_error['msg']}"
+        return
+
+    yield "💾 Saving LoRA adapter..."
+    peft_model.save_pretrained(save_path)
+    _tokenizer.save_pretrained(save_path)
+
+    personalities[personality_name] = save_path
+    yield f"🎉 Personality '{personality_name}' created and registered!"
+    yield "DONE"
+
+
+# =============================================================================
+# SECTION 7: Curriculum Graph Utilities  ← NEW
+# =============================================================================
+
+def load_curriculum_from_file(filepath: str) -> dict:
+    """
+    Parse a curriculum JSON file.
+
+    Expected JSON shape:
+    {
+      "title": "Introduction to Fractions",
+      "start": "fractions_basics",
+      "nodes": [
+        {
+          "id":          "fractions_basics",
+          "title":       "What Are Fractions?",
+          "description": "Understanding parts of a whole using numerator/denominator.",
+          "book":        "Math Fundamentals"   ← optional: ties to a loaded book title
+        },
+        {
+          "id":          "equivalent_fractions",
+          "title":       "Equivalent Fractions",
+          "description": "Finding fractions that represent the same value.",
+          "book":        "Math Fundamentals"
+        }
+      ],
+      "edges": [
+        { "from": "fractions_basics", "to": "equivalent_fractions" }
+      ]
+    }
+    """
+    with open(filepath, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def get_curriculum_order(graph: dict) -> list[dict]:
+    """BFS topological sort of curriculum nodes starting from 'start' node."""
+    if not graph or not graph.get("nodes"):
+        return []
+
+    nodes  = {n["id"]: n for n in graph["nodes"]}
+    edges  = graph.get("edges", [])
+    start  = graph.get("start")
+
+    adj       = {nid: [] for nid in nodes}
+    in_degree = {nid: 0  for nid in nodes}
+    for e in edges:
+        adj[e["from"]].append(e["to"])
+        in_degree[e["to"]] += 1
+
+    # Seed BFS
+    bfs_queue = []
+    if start and start in nodes:
+        bfs_queue.append(start)
+    else:
+        bfs_queue = [nid for nid, deg in in_degree.items() if deg == 0]
+
+    visited, order = set(), []
+    while bfs_queue:
+        curr = bfs_queue.pop(0)
+        if curr in visited:
+            continue
+        visited.add(curr)
+        order.append(nodes[curr])
+        for neighbor in adj.get(curr, []):
+            if neighbor not in visited:
+                bfs_queue.append(neighbor)
+
+    return order
+
+
+def get_next_topic(graph: dict, completed_ids: list[str]) -> Optional[dict]:
+    """Return the first unvisited node in curriculum order."""
+    for node in get_curriculum_order(graph):
+        if node["id"] not in completed_ids:
+            return node
+    return None
+
+
+def render_curriculum_text(graph: dict, completed_ids: list[str], current_id: Optional[str]) -> str:
+    """Render the curriculum as a readable text graph for the UI."""
+    if not graph:
+        return "No curriculum loaded."
+
+    lines = [f"📚 Curriculum: {graph.get('title', 'Untitled')}\n"]
+    order = get_curriculum_order(graph)
+
+    for i, node in enumerate(order):
+        nid = node["id"]
+        if nid in completed_ids:
+            icon = "✅"
+        elif nid == current_id:
+            icon = "▶️ "
+        else:
+            icon = "⬜"
+
+        connector = "└─" if i == len(order) - 1 else "├─"
+        lines.append(f"  {connector} {icon} {node['title']}")
+        if node.get("description"):
+            lines.append(f"  │     {node['description'][:80]}")
+        if node.get("book"):
+            lines.append(f"  │     📖 Book: {node['book']}")
+
+    return "\n".join(lines)
+
+
+# =============================================================================
+# SECTION 8: Book Utilities  ← NEW
+# =============================================================================
+
+def load_book_text(filepath: str) -> str:
+    """Load plain text from a .txt book file."""
+    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+def get_book_excerpt_for_topic(
+    books_store: dict[str, str],
+    topic_node: dict,
+    max_chars: int = 1800,
+) -> str:
+    """
+    Extract the most relevant excerpt from the appropriate book for this topic.
+    Uses keyword scoring across paragraphs to surface the best-matching content.
+    """
+    # Prefer the book explicitly linked to this topic node
+    book_name = topic_node.get("book", "")
+    if book_name and book_name in books_store:
+        text = books_store[book_name]
+    elif books_store:
+        text = list(books_store.values())[0]
+    else:
+        return ""
+
+    # Build keyword list from title + description
+    raw_keywords = (topic_node.get("title", "") + " " + topic_node.get("description", "")).lower()
+    keywords     = [w for w in raw_keywords.split() if len(w) > 3]
+
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    scored     = sorted(
+        [(sum(1 for k in keywords if k in p.lower()), p) for p in paragraphs],
+        key=lambda x: -x[0],
+    )
+
+    top_paras = [p for score, p in scored[:4] if score > 0]
+    if not top_paras:
+        top_paras = paragraphs[:3]   # fallback: opening of the book
+
+    excerpt = "\n\n".join(top_paras)
+    return excerpt[:max_chars]
+
+
+# =============================================================================
+# SECTION 9: Master Prompt Builder  ← NEW
+# =============================================================================
+
+def build_master_prompt(
+    personality_name: str,
+    graph: dict,
+    books_store: dict[str, str],
+    session: dict,
+) -> str:
+    """
+    Dynamically build the system prompt that governs the teaching session.
+
+    Teaching phases (tracked in session["phase"]):
+      "negotiate" — greet, probe prior knowledge, calibrate level
+      "teach"     — deliver curriculum content from books
+      "advance"   — topic complete; move to next node
+    """
+
+    # ── Personality description ───────────────────────────────────────────────
+    personality_desc = session.get(
+        "personality_desc",
+        "a warm, patient, and encouraging teacher who adapts to each student's pace",
+    )
+
+    completed    = session.get("completed_topics", [])
+    current_id   = session.get("current_topic")
+    phase        = session.get("phase", "negotiate")
+
+    # ── Resolve current node ──────────────────────────────────────────────────
+    current_node: Optional[dict] = None
+    if graph:
+        nodes_map = {n["id"]: n for n in graph.get("nodes", [])}
+        if current_id and current_id in nodes_map:
+            current_node = nodes_map[current_id]
+        else:
+            current_node = get_next_topic(graph, completed)
+            if current_node:
+                session["current_topic"] = current_node["id"]
+                session["phase"]         = "negotiate"
+                phase                    = "negotiate"
+
+    # ── Build system prompt ───────────────────────────────────────────────────
+    lines = [f"You are {personality_desc}."]
+
+    if graph and current_node:
+        ordered   = get_curriculum_order(graph)
+        total     = len(ordered)
+        done_count = len(completed)
+
+        lines += [
+            "",
+            f"=== CURRICULUM: {graph.get('title', 'Learning Plan')} ===",
+            f"Overall progress : {done_count}/{total} topics completed.",
+            f"Current topic    : {current_node['title']}",
+        ]
+        if current_node.get("description"):
+            lines.append(f"Learning goal    : {current_node['description']}")
+
+        # Show what's ahead (next 3)
+        upcoming = [n for n in ordered if n["id"] not in completed and n["id"] != current_node["id"]]
+        if upcoming:
+            lines.append("Coming up        : " + " → ".join(n["title"] for n in upcoming[:3]))
+
+        # ── Inject relevant book content ──────────────────────────────────────
+        if books_store:
+            excerpt = get_book_excerpt_for_topic(books_store, current_node)
+            if excerpt:
+                lines += [
+                    "",
+                    "=== REFERENCE MATERIAL (from uploaded books) ===",
+                    excerpt,
+                    "=== END OF REFERENCE MATERIAL ===",
+                ]
+
+        # ── Phase-specific instructions ───────────────────────────────────────
+        lines += ["", "=== YOUR TEACHING INSTRUCTIONS ==="]
+
+        if phase == "negotiate":
+            lines += [
+                "PHASE — NEGOTIATE:",
+                "1. Warmly greet the student and introduce the current topic.",
+                "2. Ask 1–2 focused questions to gauge what they already know.",
+                "3. Based on their answer, decide the depth and pace of teaching.",
+                "4. Confirm your plan with the student and ask if they are ready.",
+                "5. Once they confirm readiness, end your message with the hidden",
+                "   signal ##READY## on a new line (the student will not see this).",
+                "   Do NOT include ##READY## before the student confirms.",
+            ]
+        elif phase == "teach":
+            lines += [
+                "PHASE — TEACH:",
+                "1. Use the reference material above as your primary source.",
+                "2. Explain concepts clearly; use concrete examples and analogies.",
+                "3. After each key concept, ask a checking question.",
+                "4. Adjust depth based on the student's responses.",
+                "5. When the student demonstrates solid understanding of the full",
+                "   topic, praise them and add the hidden signal ##TOPIC_DONE##",
+                "   on a new line. Do NOT add ##TOPIC_DONE## prematurely.",
+            ]
+        else:  # "advance"
+            lines += [
+                "PHASE — ADVANCE:",
+                "Announce the topic is complete. Preview the next topic briefly.",
+                "Ask the student if they want to continue.",
+            ]
+
+    else:
+        # No curriculum loaded — free-form teaching
+        lines += [
+            "",
+            "No curriculum is loaded. Teach the student on whatever topic they raise,",
+            "adapting warmly to their level.",
+        ]
+
+    return "\n".join(lines)
+
+
+# =============================================================================
+# SECTION 10: Chat Function  ← EXTENDED
+# =============================================================================
+
+def chat(
+    user_input: str,
+    personality_name: str,
+    history: list,
+    session: dict,
+) -> tuple[str, dict]:
+    """
+    Chat with the LoRA-personality teacher, guided by curriculum + books.
+
+    session dict keys
+    -----------------
+    phase            : "negotiate" | "teach" | "advance"
+    current_topic    : str | None   (node id)
+    completed_topics : list[str]    (node ids)
+    personality_desc : str          (optional override)
+    """
+
+    if not user_input or not user_input.strip():
+        return "⚠️ Please enter a message.", session
+
+    load_base_model_and_tokenizer()
+
+    # ── FIX 1 + 7: Soft teaching guidance — personality leads, rules follow ──
+    # Personality + curriculum context is built first so it dominates the
+    # model's attention. A light, non-prescriptive nudge follows — no rigid
+    # rules, no sentence-count mandates, no "you are doing it wrong" shaming.
+    curriculum_context = build_master_prompt(personality_name, curriculum_graph, books, session)
+
+    soft_guidance = (
+        "You are a warm, patient teacher. "
+        "Teach in small, simple steps. "
+        "Keep responses natural, conversational, and adaptive to the student."
+    )
+
+    system_msg = curriculum_context + "\n\n" + soft_guidance
+
+    # ── History: clean role labels, no artificial step-count annotations ──────
+    history_text = ""
+    for human, assistant in (history or [])[-4:]:
+        history_text += (
+            f"<|user|>\nStudent: {human}</s>\n"
+            f"<|assistant|>\nTeacher: {assistant}</s>\n"
+        )
+
+    # ── FIX 2: Plain "Teacher:" prefix — no rigid labels ─────────────────────
+    prompt = (
+        f"<|system|>\n{system_msg}</s>\n"
+        f"{history_text}"
+        f"<|user|>\nStudent: {user_input.strip()}</s>\n"
+        f"<|assistant|>\nTeacher:"
+    )
+
+    adapter_path = personalities.get(personality_name)
+    inputs = _tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=1536,
+    ).to(_base_model.device)
+
+    if adapter_path and os.path.isdir(adapter_path):
+        model_for_chat = PeftModel.from_pretrained(_base_model, adapter_path)
+        model_for_chat.eval()
+    else:
+        model_for_chat = _base_model
+        model_for_chat.eval()
+
+    with torch.no_grad():
+        output_ids = model_for_chat.generate(
+            **inputs,
+            max_new_tokens=60,        # FIX 6: room for natural emotional response
+            do_sample=True,
+            temperature=0.4,          # FIX 8: tighter distribution → less narration drift
+            top_p=0.9,
+            repetition_penalty=1.2,
+            eos_token_id=_tokenizer.convert_tokens_to_ids("</s>"),
+            pad_token_id=_tokenizer.pad_token_id,
+        )
+
+    generated_ids = output_ids[0][inputs["input_ids"].shape[1]:]
+    raw_response  = _tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+
+    # ── FIX 5: Naturality filter ──────────────────────────────────────────────
+    # 5a. Strip parenthetical stage-direction narration, e.g. "(The student…)"
+    raw_response = re.sub(r"\([^)]*\)", "", raw_response)
+
+    # 5b. Remove any leaked role markers the model may have echoed
+    for marker in ("Teacher (one small step only):", "Teacher:", "Student:"):
+        raw_response = raw_response.replace(marker, "")
+
+    # 5c. Strip any residual step-count annotations, e.g. "(two small steps)"
+    raw_response = re.sub(r"\(\s*\w[\w\s]*step[s]?\s*\)", "", raw_response, flags=re.IGNORECASE)
+
+    raw_response = raw_response.strip()
+
+    # FIX 3 + 4: Hard truncation and forced question REMOVED — model decides.
+
+    # ── Parse hidden curriculum signals before showing output to student ──────
+    response = raw_response
+
+    # Signal: negotiation complete, ready to teach
+    if "##READY##" in response:
+        response = response.replace("##READY##", "").strip()
+        session["phase"] = "teach"
+
+    # Signal: topic teaching complete, advance to next
+    if "##TOPIC_DONE##" in response:
+        response = response.replace("##TOPIC_DONE##", "").strip()
+
+        completed = session.get("completed_topics", [])
+        current   = session.get("current_topic")
+
+        if current and current not in completed:
+            completed.append(current)
+        session["completed_topics"] = completed
+        session["current_topic"]    = None
+        session["phase"]            = "advance"
+
+        next_node = get_next_topic(curriculum_graph, completed)
+        if next_node:
+            response += (
+                f"\n\n🎉 Great work completing **{current}**! "
+                f"Next up: **{next_node['title']}**. Ready to continue?"
+            )
+            session["current_topic"] = next_node["id"]
+            session["phase"]         = "negotiate"
+        else:
+            response += "\n\n🎓 You've completed the **entire curriculum**! Fantastic work."
+
+    if adapter_path and isinstance(model_for_chat, PeftModel):
+        del model_for_chat
+        torch.cuda.empty_cache()
+
+    return (
+        response if response else "🤔 Could you rephrase that?",
+        session,
+    )
+
+
+# =============================================================================
+# SECTION 11: Personality Management Utilities  (unchanged)
+# =============================================================================
+
+def get_personality_list() -> list[str]:
+    return list(personalities.keys())
+
+
+def delete_personality(personality_name: str) -> tuple[str, gr.Dropdown]:
+    if personality_name == "default (no adapter)":
+        return "❌ Cannot delete the default personality.", gr.Dropdown(choices=get_personality_list())
+
+    if personality_name not in personalities:
+        return f"❌ '{personality_name}' not found.", gr.Dropdown(choices=get_personality_list())
+
+    adapter_path = personalities.pop(personality_name)
+    if adapter_path and os.path.isdir(adapter_path):
+        shutil.rmtree(adapter_path)
+
+    updated = get_personality_list()
+    return f"🗑️ Personality '{personality_name}' deleted.", gr.Dropdown(choices=updated, value=updated[0])
+
+
+def refresh_dropdown() -> gr.Dropdown:
+    choices = get_personality_list()
+    return gr.Dropdown(choices=choices, value=choices[0])
+
+
+def scan_existing_personalities():
+    os.makedirs(LORA_DIR, exist_ok=True)
+    for folder in Path(LORA_DIR).iterdir():
+        if folder.is_dir() and (folder / "adapter_config.json").exists():
+            personalities[folder.name] = str(folder)
+    print(f"[INFO] Registered personalities: {list(personalities.keys())}")
+
+
+# =============================================================================
+# SECTION 12: Gradio UI Handler Functions  ← EXTENDED
+# =============================================================================
+
+# ── Personality handlers (unchanged) ─────────────────────────────────────────
+
+def handle_create_personality(file, personality_name: str):
+    if file is None:
+        yield "❌ Please upload a .txt conversation file first.", gr.Dropdown(choices=get_personality_list()), gr.Button(interactive=True)
+        return
+
+    filepath = file if isinstance(file, str) else file.name
+    if not filepath.endswith(".txt"):
+        yield "❌ Only .txt files are supported.", gr.Dropdown(choices=get_personality_list()), gr.Button(interactive=True)
+        return
+
+    try:
+        raw_samples = parse_conversation_file(filepath)
+    except Exception as e:
+        yield f"❌ Failed to read file: {e}", gr.Dropdown(choices=get_personality_list()), gr.Button(interactive=True)
+        return
+
+    if not raw_samples:
+        yield "❌ No valid Teacher–Student pairs found.", gr.Dropdown(choices=get_personality_list()), gr.Button(interactive=True)
+        return
+
+    accumulated_log = ""
+    for msg in train_lora(personality_name, raw_samples):
+        if msg == "DONE":
+            accumulated_log += "\n✅ Training complete! You can now chat."
+            updated = get_personality_list()
+            yield accumulated_log, gr.Dropdown(choices=updated, value=personality_name.strip().replace(" ", "_").lower()), gr.Button(interactive=True)
+            return
+        else:
+            accumulated_log += f"\n{msg}"
+            yield accumulated_log, gr.Dropdown(choices=get_personality_list()), gr.Button(interactive=False)
+
+
+# ── Curriculum handlers ← NEW ─────────────────────────────────────────────────
+
+def handle_load_curriculum(file) -> tuple[str, str]:
+    """Load a curriculum JSON and return (status_msg, rendered_graph_text)."""
+    global curriculum_graph
+
+    if file is None:
+        return "❌ Please upload a curriculum JSON file.", ""
+
+    filepath = file if isinstance(file, str) else file.name
+    if not filepath.endswith(".json"):
+        return "❌ Curriculum must be a .json file.", ""
+
+    try:
+        curriculum_graph = load_curriculum_from_file(filepath)
+    except Exception as e:
+        return f"❌ Failed to parse curriculum: {e}", ""
+
+    node_count = len(curriculum_graph.get("nodes", []))
+    edge_count = len(curriculum_graph.get("edges", []))
+    title      = curriculum_graph.get("title", "Untitled")
+
+    graph_text = render_curriculum_text(curriculum_graph, [], curriculum_graph.get("start"))
+    return (
+        f"✅ Curriculum loaded: '{title}' — {node_count} topics, {edge_count} connections.",
+        graph_text,
+    )
+
+
+def handle_clear_curriculum() -> tuple[str, str]:
+    global curriculum_graph
+    curriculum_graph = {}
+    return "🗑️ Curriculum cleared.", ""
+
+
+# ── Book handlers ← NEW ───────────────────────────────────────────────────────
+
+def handle_load_book(file, book_title: str) -> tuple[str, str]:
+    """Load a .txt book and register it under the given title."""
+    global books
+
+    if file is None:
+        return "❌ Please upload a .txt book file.", render_book_list()
+
+    filepath = file if isinstance(file, str) else file.name
+    if not filepath.endswith(".txt"):
+        return "❌ Only .txt book files are supported.", render_book_list()
+
+    title = book_title.strip() if book_title.strip() else Path(filepath).stem
+
+    try:
+        os.makedirs(BOOKS_DIR, exist_ok=True)
+        text       = load_book_text(filepath)
+        books[title] = text
+        dest = os.path.join(BOOKS_DIR, f"{title}.txt")
+        shutil.copy(filepath, dest)
+    except Exception as e:
+        return f"❌ Failed to load book: {e}", render_book_list()
+
+    word_count = len(text.split())
+    return (
+        f"✅ Book '{title}' loaded — {word_count:,} words.",
+        render_book_list(),
+    )
+
+
+def handle_remove_book(book_title: str) -> tuple[str, str]:
+    if book_title in books:
+        del books[book_title]
+        dest = os.path.join(BOOKS_DIR, f"{book_title}.txt")
+        if os.path.exists(dest):
+            os.remove(dest)
+        return f"🗑️ Book '{book_title}' removed.", render_book_list()
+    return f"❌ Book '{book_title}' not found.", render_book_list()
+
+
+def get_book_titles() -> list[str]:
+    return list(books.keys())
+
+
+def render_book_list() -> str:
+    if not books:
+        return "No books loaded."
+    lines = ["📖 Loaded Books:\n"]
+    for i, (title, text) in enumerate(books.items(), 1):
+        wc = len(text.split())
+        lines.append(f"  {i}. {title}  ({wc:,} words)")
+    return "\n".join(lines)
+
+
+# ── Chat handler ← EXTENDED ───────────────────────────────────────────────────
+
+def handle_chat(
+    user_input: str,
+    personality_name: str,
+    history: list,
+    session: dict,
+) -> tuple[list, str, dict, str]:
+    """
+    Returns updated: history, cleared_input, session, curriculum_display.
+    """
+    if not user_input.strip():
+        return history, "", session, render_curriculum_text(
+            curriculum_graph,
+            session.get("completed_topics", []),
+            session.get("current_topic"),
+        )
+
+    response, updated_session = chat(user_input, personality_name, history, session)
+    history = (history or []) + [(user_input, response)]
+
+    graph_text = render_curriculum_text(
+        curriculum_graph,
+        updated_session.get("completed_topics", []),
+        updated_session.get("current_topic"),
+    )
+
+    return history, "", updated_session, graph_text
+
+
+def handle_reset_session(session: dict) -> tuple[dict, str]:
+    """Reset teaching progress without clearing curriculum or books."""
+    new_session = {
+        "phase":            "negotiate",
+        "current_topic":    None,
+        "completed_topics": [],
+        "personality_desc": session.get("personality_desc", ""),
+    }
+    return new_session, render_curriculum_text(curriculum_graph, [], None)
+
+
+# =============================================================================
+# SECTION 13: Gradio UI Layout  ← EXTENDED
+# =============================================================================
+
+def build_ui():
+    css = """
+    .panel { border: 1px solid #e0e0e0; border-radius: 10px; padding: 16px; }
+    .graph-box textarea { font-family: monospace !important; font-size: 13px !important; }
+    footer { display: none !important; }
+    """
+
+    initial_session = {
+        "phase":            "negotiate",
+        "current_topic":    None,
+        "completed_topics": [],
+        "personality_desc": "a warm, patient, and encouraging teacher who adapts to each student's pace",
+    }
+
+    with gr.Blocks(title="🧠 LoRA Curriculum Trainer", css=css, theme=gr.themes.Soft()) as demo:
+
+        session_state = gr.State(initial_session)
+
+        gr.Markdown(
+            """
+            # 🧠 LoRA Personality · Curriculum · Book Teaching System
+            **Train a personality → Load a curriculum graph → Add books → Chat teaches automatically.**
+            """
+        )
+
+        with gr.Tabs():
+
+            # ================================================================
+            # TAB 1 — Personality
+            # ================================================================
+            with gr.TabItem("🎭 Personality"):
+                with gr.Row():
+                    with gr.Column(scale=1, elem_classes="panel"):
+                        gr.Markdown("### 📤 Create New Personality")
+
+                        file_upload = gr.File(
+                            label="Upload Conversation File (.txt)",
+                            file_types=[".txt"],
+                            type="filepath",
+                        )
+                        personality_name_input = gr.Textbox(
+                            label="Personality Name",
+                            placeholder="e.g. friendly_math_teacher",
+                            max_lines=1,
+                        )
+                        create_btn  = gr.Button("🚀 Create Personality", variant="primary")
+                        progress_box = gr.Textbox(
+                            label="Training Progress",
+                            lines=12,
+                            interactive=False,
+                            placeholder="Training logs will appear here…",
+                        )
+                        gr.Markdown(
+                            """
+                            **Conversation file format:**
+                            ```
+                            Student: I'm confused about fractions.
+                            Teacher: No worries! Let's start from the basics.
+                            Student: Okay, that helps.
+                            Teacher: Great! Now let's try an example.
+                            ```
+                            """
+                        )
+
+                    with gr.Column(scale=1, elem_classes="panel"):
+                        gr.Markdown("### 🗂 Manage Personalities")
+
+                        with gr.Row():
+                            personality_dropdown = gr.Dropdown(
+                                label="Active Personality",
+                                choices=get_personality_list(),
+                                value="default (no adapter)",
+                                interactive=True,
+                            )
+                            refresh_btn = gr.Button("🔄", scale=0)
+
+                        delete_btn    = gr.Button("🗑️ Delete Selected", variant="stop")
+                        delete_status = gr.Textbox(label="Status", interactive=False, max_lines=1)
+
+            # ================================================================
+            # TAB 2 — Curriculum Graph
+            # ================================================================
+            with gr.TabItem("🗺 Curriculum"):
+                with gr.Row():
+                    with gr.Column(scale=1, elem_classes="panel"):
+                        gr.Markdown("### 📂 Load Curriculum JSON")
+
+                        curriculum_file = gr.File(
+                            label="Upload Curriculum (.json)",
+                            file_types=[".json"],
+                            type="filepath",
+                        )
+                        load_curriculum_btn  = gr.Button("📥 Load Curriculum",  variant="primary")
+                        clear_curriculum_btn = gr.Button("🗑️ Clear Curriculum", variant="stop")
+                        curriculum_status    = gr.Textbox(
+                            label="Status",
+                            interactive=False,
+                            max_lines=2,
+                        )
+
+                        gr.Markdown(
+                            """
+                            **Curriculum JSON format:**
+                            ```json
+                            {
+                              "title": "Introduction to Fractions",
+                              "start": "frac_basics",
+                              "nodes": [
+                                {
+                                  "id": "frac_basics",
+                                  "title": "What Are Fractions?",
+                                  "description": "Numerator, denominator, and parts of a whole.",
+                                  "book": "Math Fundamentals"
+                                },
+                                {
+                                  "id": "equiv_frac",
+                                  "title": "Equivalent Fractions",
+                                  "description": "Fractions with different numbers but equal value.",
+                                  "book": "Math Fundamentals"
+                                }
+                              ],
+                              "edges": [
+                                { "from": "frac_basics", "to": "equiv_frac" }
+                              ]
+                            }
+                            ```
+                            The **"book"** field should match the title you enter when loading a book.
+                            """
+                        )
+
+                    with gr.Column(scale=1, elem_classes="panel"):
+                        gr.Markdown("### 🌲 Curriculum Graph")
+                        curriculum_graph_display = gr.Textbox(
+                            label="Topic Order (live progress)",
+                            lines=20,
+                            interactive=False,
+                            placeholder="Load a curriculum to see the graph here…",
+                            elem_classes="graph-box",
+                        )
+
+            # ================================================================
+            # TAB 3 — Books
+            # ================================================================
+            with gr.TabItem("📚 Books"):
+                with gr.Row():
+                    with gr.Column(scale=1, elem_classes="panel"):
+                        gr.Markdown("### 📖 Add Reference Book")
+
+                        book_file = gr.File(
+                            label="Upload Book (.txt)",
+                            file_types=[".txt"],
+                            type="filepath",
+                        )
+                        book_title_input = gr.Textbox(
+                            label="Book Title",
+                            placeholder="e.g. Math Fundamentals  (must match 'book' field in curriculum JSON)",
+                            max_lines=1,
+                        )
+                        load_book_btn  = gr.Button("📥 Add Book",      variant="primary")
+                        book_status    = gr.Textbox(label="Status", interactive=False, max_lines=1)
+
+                    with gr.Column(scale=1, elem_classes="panel"):
+                        gr.Markdown("### 🗂 Loaded Books")
+                        book_list_display = gr.Textbox(
+                            label="Book Library",
+                            lines=10,
+                            interactive=False,
+                            value="No books loaded.",
+                        )
+                        book_remove_title = gr.Textbox(
+                            label="Book Title to Remove",
+                            placeholder="Enter exact title",
+                            max_lines=1,
+                        )
+                        remove_book_btn = gr.Button("🗑️ Remove Book", variant="stop")
+
+            # ================================================================
+            # TAB 4 — Chat
+            # ================================================================
+            with gr.TabItem("💬 Chat"):
+                with gr.Row():
+
+                    # LEFT: curriculum progress sidebar
+                    with gr.Column(scale=1, elem_classes="panel"):
+                        gr.Markdown("### 📊 Session Progress")
+
+                        active_personality = gr.Dropdown(
+                            label="Personality",
+                            choices=get_personality_list(),
+                            value="default (no adapter)",
+                            interactive=True,
+                        )
+                        refresh_chat_btn = gr.Button("🔄 Refresh Personalities", scale=0)
+
+                        chat_graph_display = gr.Textbox(
+                            label="Curriculum Progress",
+                            lines=16,
+                            interactive=False,
+                            placeholder="Load a curriculum to see progress here…",
+                            elem_classes="graph-box",
+                        )
+                        reset_session_btn = gr.Button("🔁 Reset Teaching Session", variant="stop")
+
+                    # RIGHT: chat window
+                    with gr.Column(scale=2, elem_classes="panel"):
+                        gr.Markdown("### 💬 Teaching Chat")
+
+                        chatbot = gr.Chatbot(
+                            label="Conversation",
+                            height=450,
+                            bubble_full_width=False,
+                        )
+
+                        with gr.Row():
+                            chat_input = gr.Textbox(
+                                placeholder="Type your message…",
+                                show_label=False,
+                                scale=5,
+                            )
+                            send_btn = gr.Button("Send ➤", scale=1, variant="primary")
+
+                        clear_chat_btn = gr.Button("🧹 Clear Chat")
+
+        # ====================================================================
+        # Event Wiring
+        # ====================================================================
+
+        # Personality tab
+        create_btn.click(
+            fn=handle_create_personality,
+            inputs=[file_upload, personality_name_input],
+            outputs=[progress_box, personality_dropdown, create_btn],
+        )
+        delete_btn.click(
+            fn=delete_personality,
+            inputs=[personality_dropdown],
+            outputs=[delete_status, personality_dropdown],
+        )
+        refresh_btn.click(fn=refresh_dropdown, outputs=[personality_dropdown])
+
+        # Curriculum tab
+        load_curriculum_btn.click(
+            fn=handle_load_curriculum,
+            inputs=[curriculum_file],
+            outputs=[curriculum_status, curriculum_graph_display],
+        )
+        clear_curriculum_btn.click(
+            fn=handle_clear_curriculum,
+            outputs=[curriculum_status, curriculum_graph_display],
+        )
+
+        # Books tab
+        load_book_btn.click(
+            fn=handle_load_book,
+            inputs=[book_file, book_title_input],
+            outputs=[book_status, book_list_display],
+        )
+        remove_book_btn.click(
+            fn=handle_remove_book,
+            inputs=[book_remove_title],
+            outputs=[book_status, book_list_display],
+        )
+
+        # Chat tab
+        send_btn.click(
+            fn=handle_chat,
+            inputs=[chat_input, active_personality, chatbot, session_state],
+            outputs=[chatbot, chat_input, session_state, chat_graph_display],
+        )
+        chat_input.submit(
+            fn=handle_chat,
+            inputs=[chat_input, active_personality, chatbot, session_state],
+            outputs=[chatbot, chat_input, session_state, chat_graph_display],
+        )
+        clear_chat_btn.click(
+            fn=lambda s: ([], "", s),
+            inputs=[session_state],
+            outputs=[chatbot, chat_input, session_state],
+        )
+        reset_session_btn.click(
+            fn=handle_reset_session,
+            inputs=[session_state],
+            outputs=[session_state, chat_graph_display],
+        )
+        refresh_chat_btn.click(fn=refresh_dropdown, outputs=[active_personality])
+
+    return demo
+
+
+# =============================================================================
+# SECTION 14: Launch
+# =============================================================================
+
+if __name__ == "__main__":
+    os.makedirs(LORA_DIR,      exist_ok=True)
+    os.makedirs(BOOKS_DIR,     exist_ok=True)
+    os.makedirs(CURRICULA_DIR, exist_ok=True)
+
+    scan_existing_personalities()
+
+    # Pre-load any books saved from previous sessions
+    for book_path in Path(BOOKS_DIR).glob("*.txt"):
+        title = book_path.stem
+        if title not in books:
+            books[title] = load_book_text(str(book_path))
+            print(f"[INFO] Pre-loaded book: '{title}'")
+
+    print("[INFO] Pre-loading base model…")
+    load_base_model_and_tokenizer()
+
+    app = build_ui()
+    app.launch(share=True, debug=False, show_error=True)
