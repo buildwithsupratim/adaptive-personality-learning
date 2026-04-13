@@ -1,5 +1,6 @@
 # adaptive-personality-learning
 An AI-powered teaching engine that combines personality, curriculum graphs, and books to deliver adaptive, personalized learning experiences.
+https://colab.research.google.com/github/buildwithsupratim/adaptive-personality-learning/blob/main/Adaptive_Personality_Learning.ipynb
 
 # LoRA Personality & Curriculum Teaching System
 
